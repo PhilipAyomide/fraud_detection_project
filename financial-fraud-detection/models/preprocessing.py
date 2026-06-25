@@ -2,6 +2,7 @@ import pandas as pd  # Import pandas for DataFrame manipulation.
 import numpy as np  # Import numpy for numerical operations.
 from sklearn.preprocessing import StandardScaler  # Import StandardScaler to normalize feature values.
 from sklearn.model_selection import train_test_split  # Import train_test_split to divide data into training and testing sets.
+from imblearn.over_sampling import SMOTE  # Import SMOTE to balance imbalanced class distributions.
 
 
 def remove_duplicates(df):
@@ -76,12 +77,12 @@ def scale_features(df, target_column='is_fraud'):
     
     StandardScaler transforms features to have mean=0 and standard deviation=1.
     The target column (label) is excluded from scaling as it should remain unchanged.
-    Non-numerical columns are preserved without scaling.
+    Non-numeric and identifier columns are removed before scaling.
     
     Parameters:
     -----------
     df : pandas.DataFrame
-        The input DataFrame with numerical features and a target column.
+        The input DataFrame with features and a target column.
     
     target_column : str, default='is_fraud'
         The name of the target column to exclude from scaling.
@@ -95,40 +96,58 @@ def scale_features(df, target_column='is_fraud'):
         The fitted scaler object that can be used to transform new data later.
     """
     # Separate features and target label.
-    # Features: all columns except the target column.
     X = df.drop(columns=[target_column])
-    
-    # Target: the specified target column (should not be scaled).
     y = df[[target_column]]
-    
-    # Select only numerical columns for scaling.
-    # select_dtypes() filters columns to include only numeric types (int, float, etc.).
+
+    # Print dtypes for all columns before any feature selection or scaling.
+    print("DataFrame column dtypes:")
+    print(df.dtypes)
+
+    # Detect and report non-numeric columns before scaling.
+    non_numeric_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric_cols:
+        print("Non-numeric columns detected:")
+        for col in non_numeric_cols:
+            print(f"  - {col}")
+    else:
+        print("No non-numeric columns detected.")
+
+    identifier_cols = [
+        col for col in X.columns
+        if col.lower() == "transactionid"
+        or col.lower().endswith("_id")
+        or col.lower().endswith("id")
+        or "identifier" in col.lower()
+    ]
+
+    if identifier_cols:
+        print("Identifier columns detected and dropped:")
+        for col in identifier_cols:
+            print(f"  - {col}")
+        X = X.drop(columns=identifier_cols, errors="ignore")
+
+    if non_numeric_cols:
+        # After dropping identifiers, drop any remaining non-numeric columns.
+        remaining_non_numeric = X.select_dtypes(exclude=[np.number]).columns.tolist()
+        if remaining_non_numeric:
+            print("Dropping remaining non-numeric columns before scaling:")
+            for col in remaining_non_numeric:
+                print(f"  - {col}")
+            X = X.drop(columns=remaining_non_numeric, errors="ignore")
+
+    # Keep only numeric features for scaling.
     numerical_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    non_numerical_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-    
-    # Initialize the StandardScaler object.
+    print(f"Final training columns ({len(numerical_cols)}): {numerical_cols}")
+
     scaler = StandardScaler()
-    
-    # Fit the scaler on the numerical features and transform them in one step.
-    X_numerical = X[numerical_cols]
-    X_numerical_scaled = scaler.fit_transform(X_numerical)
-    
-    # Convert the scaled numpy array back to a pandas DataFrame with original column names.
+    X_numerical_scaled = scaler.fit_transform(X[numerical_cols])
     X_scaled_df = pd.DataFrame(X_numerical_scaled, columns=numerical_cols, index=df.index)
-    
-    # Include non-numerical columns without scaling.
-    if non_numerical_cols:
-        X_non_numerical = X[non_numerical_cols]
-        X_scaled_df = pd.concat([X_scaled_df, X_non_numerical], axis=1)
-    
-    # Concatenate the scaled features with the target column.
+
     df_scaled = pd.concat([X_scaled_df, y], axis=1)
-    
-    # Print scaling summary information.
+
     print(f"Numerical features scaled: {len(numerical_cols)}")
-    print(f"Non-numerical features preserved: {len(non_numerical_cols)}")
-    print(f"Scaling method: StandardScaler (mean=0, std=1)")
-    
+    print("Scaling method: StandardScaler (mean=0, std=1)")
+
     return df_scaled, scaler
 
 
@@ -258,6 +277,66 @@ def split_train_test(df, target_column='is_fraud', test_size=0.2, random_state=4
     return X_train, X_test, y_train, y_test
 
 
+def apply_smote_to_training_data(X_train, y_train, random_state=42):
+    """Apply SMOTE oversampling to the training dataset only.
+
+    This function MUST be called after `split_train_test()` so that SMOTE is
+    applied only to the training partition (to avoid information leakage into
+    the test set).
+
+    Parameters
+    ----------
+    X_train : pandas.DataFrame
+        Training features (only these will be oversampled).
+    y_train : pandas.Series
+        Training labels corresponding to `X_train`.
+    random_state : int, default=42
+        Random seed for SMOTE reproducibility.
+
+    Returns
+    -------
+    X_resampled : pandas.DataFrame
+        Oversampled training features as a DataFrame with the original column names.
+    y_resampled : pandas.Series
+        Oversampled training labels as a Series (balanced counts for each class).
+
+    Steps
+    -----
+    1. Print class distribution before SMOTE so the user can see imbalance.
+    2. Create and apply SMOTE to `X_train` and `y_train` only.
+    3. Convert the numpy outputs back to pandas objects and print new distribution.
+    4. Return balanced `X_resampled` and `y_resampled`.
+    """
+
+    # 1) Show class distribution before applying SMOTE
+    # `value_counts()` gives the raw counts for each label (e.g., 0: legit, 1: fraud)
+    print("Training class distribution before SMOTE:")
+    counts_before = y_train.value_counts()
+    print(counts_before)
+
+    # 2) Create SMOTE instance from imbalanced-learn. SMOTE generates synthetic
+    # samples of the minority class by interpolating between nearest neighbors.
+    smote = SMOTE(random_state=random_state)
+
+    # 3) Apply SMOTE to the training set only. `fit_resample` returns numpy
+    # arrays for X and y. This does not touch the test set, preventing leakage.
+    X_resampled_array, y_resampled_array = smote.fit_resample(X_train, y_train)
+
+    # 4) Convert back to pandas objects. Preserve original feature names.
+    # The resampled data will have a new integer index; reset is intentional
+    # because synthetic samples do not map to original indices.
+    X_resampled = pd.DataFrame(X_resampled_array, columns=X_train.columns)
+    y_resampled = pd.Series(y_resampled_array, name=y_train.name)
+
+    # 5) Print class distribution after SMOTE to confirm balancing.
+    print("Training class distribution after SMOTE:")
+    counts_after = y_resampled.value_counts()
+    print(counts_after)
+
+    # 6) Return balanced training data to be used by model training only.
+    return X_resampled, y_resampled
+
+
 if __name__ == "__main__":
     # Entry point for testing the preprocessing functions.
     from data_loader import load_creditcard_csv
@@ -277,8 +356,12 @@ if __name__ == "__main__":
         # Split the preprocessed data into training and testing sets.
         print("\n")
         X_train, X_test, y_train, y_test = split_train_test(processed_df)
-        
+
+        # Apply SMOTE oversampling only to the training set, leaving the test set unchanged.
+        X_train_resampled, y_train_resampled = apply_smote_to_training_data(X_train, y_train)
+
         print("\nData split complete and ready for model training!")
+        print("Note: test data is unchanged and not oversampled.")
         
     except Exception as e:
         print(f"Error during preprocessing: {e}")
