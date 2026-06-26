@@ -12,6 +12,8 @@ from sklearn.metrics import (
     classification_report,
 )
 
+from pso_feature_selection import select_pso_features
+
 
 def train_knn_model(X_train, X_test, y_train, y_test, k=5):
     """Train a KNN classifier on the provided training data and print evaluation metrics.
@@ -153,7 +155,35 @@ def main():
     try:
         raw_df = load_creditcard_csv()
         processed_df, _ = preprocess_dataset(raw_df)
-        X_train, X_test, y_train, y_test = split_train_test(processed_df)
+
+        print("\nSelecting PSO features from processed data...\n")
+        target_column = "is_fraud"
+        if target_column not in processed_df.columns:
+            raise KeyError(f"Target column '{target_column}' not found in processed dataframe.")
+
+        X = processed_df.drop(columns=[target_column])
+        y = processed_df[target_column]
+
+        selected_X, selected_features, _, _ = select_pso_features(
+            X,
+            y,
+            n_particles=20,
+            iters=10,
+            verbose=False,
+        )
+
+        original_feature_count = X.shape[1]
+        selected_feature_count = selected_X.shape[1]
+
+        print("\nPSO feature selection summary")
+        print("Original feature count:", original_feature_count)
+        print("Selected feature count:", selected_feature_count)
+        print("Selected features:", selected_features)
+
+        X_train, X_test, y_train, y_test = split_train_test(
+            pd.concat([selected_X, y], axis=1),
+            target_column=target_column
+        )
 
         # Apply SMOTE oversampling to training data only
         print("\nApplying SMOTE to training data...\n")
@@ -168,6 +198,7 @@ def main():
             k_values=[1, 3, 5, 7, 9]
         )
 
+        print(f"\nAccuracy: {results_df.loc[results_df['K'] == best_k, 'Accuracy'].iloc[0]:.4f}")
         evaluate_best_model(best_model, X_test, y_test)
         _save_trained_model(best_model)
 
