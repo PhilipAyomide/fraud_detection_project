@@ -10,19 +10,23 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
 
 try:
     from .preprocessing import (
         apply_smote_to_training_data,
-        preprocess_dataset,
+        handle_missing_values,
+        remove_duplicates,
         split_train_test,
     )
     from .data_loader import load_creditcard_csv
 except ImportError:
     from preprocessing import (
         apply_smote_to_training_data,
-        preprocess_dataset,
+        handle_missing_values,
+        remove_duplicates,
         split_train_test,
     )
     from data_loader import load_creditcard_csv
@@ -68,46 +72,66 @@ def evaluate_best_model(model, X_test, y_test):
     return cm, report
 
 
+def compute_evaluation_metrics(y_test, y_pred):
+    """Compute accuracy, precision, recall, and F1 for final model evaluation."""
+    return {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred, zero_division=0),
+        "recall": recall_score(y_test, y_pred, zero_division=0),
+        "f1_score": f1_score(y_test, y_pred, zero_division=0),
+    }
+
+
 def test_multiple_k_values(X_train, X_test, y_train, y_test, k_values=None):
-    """Evaluate KNN models over a range of k values and select the best one by F1 score."""
+    """Tune KNN hyperparameters with GridSearchCV and evaluate the best model on the test set."""
     if k_values is None:
-        k_values = [1, 3, 5, 7, 9, 11, 13, 15]
+        k_values = [3, 5, 7, 9, 11, 13, 15, 17, 19]
 
-    results = []
-    best_f1 = -1.0
-    best_k = None
-    best_model = None
+    param_grid = {
+        "n_neighbors": k_values,
+        "weights": ["uniform", "distance"],
+        "metric": ["euclidean", "manhattan", "minkowski"],
+        "p": [1, 2],
+    }
 
-    for k in k_values:
-        model, metrics = train_knn_model(X_train, X_test, y_train, y_test, k=k)
-        results.append(
-            {
-                "K": k,
-                "Accuracy": metrics["accuracy"],
-                "Precision": metrics["precision"],
-                "Recall": metrics["recall"],
-                "F1 Score": metrics["f1_score"],
-            }
-        )
+    cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-        if metrics["f1_score"] > best_f1 or (metrics["f1_score"] == best_f1 and best_k is None):
-            best_f1 = metrics["f1_score"]
-            best_k = k
-            best_model = model
-
-    results_df = pd.DataFrame(results)
-    results_df = results_df.sort_values(by="F1 Score", ascending=False).reset_index(drop=True)
+    grid_search = GridSearchCV(
+        estimator=KNeighborsClassifier(),
+        param_grid=param_grid,
+        scoring="f1",
+        n_jobs=-1,
+        cv=cv_strategy,
+        verbose=1,
+        return_train_score=True,
+    )
 
     print("\n" + "=" * 80)
-    print("KNN Baseline Performance Comparison")
+    print("Tuning KNN hyperparameters with GridSearchCV")
     print("=" * 80)
-    print(results_df.to_string(index=False))
+    grid_search.fit(X_train, y_train)
+
+    best_params = grid_search.best_params_
+    best_model = KNeighborsClassifier(**best_params)
+    best_model.fit(X_train, y_train)
+
+    print(f"\nBest parameters: {best_params}")
+    print(f"Best CV F1 score: {grid_search.best_score_:.4f}")
+
+    y_pred = best_model.predict(X_test)
+    metrics = compute_evaluation_metrics(y_test, y_pred)
+
+    results_df = pd.DataFrame(grid_search.cv_results_)
+    results_df = results_df.sort_values(by="rank_test_score").reset_index(drop=True)
+
+    print("\nFinal test-set metrics for best KNN model:")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    print(f"F1 Score: {metrics['f1_score']:.4f}")
     print("=" * 80)
 
-    print(f"\nBest K value: {best_k} with F1 Score: {best_f1:.4f}")
-    print("=" * 80)
-
-    return results_df, int(best_k), best_model
+    return results_df, best_params, best_model
 
 
 def _save_trained_model(model, filename="best_knn.pkl"):
@@ -120,15 +144,6 @@ def _save_trained_model(model, filename="best_knn.pkl"):
         pickle.dump(model, model_file)
 
     print(f"Saved trained model to: {output_path}")
-
-
-def _save_baseline_results(results_df, output_path):
-    """Save the KNN comparison results to a CSV file."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    results_df.to_csv(output_path, index=False)
-    print(f"Saved baseline results to: {output_path}")
-    return output_path
 
 
 def select_numeric_features(processed_df, target_column="is_fraud"):
@@ -149,13 +164,74 @@ def select_numeric_features(processed_df, target_column="is_fraud"):
     return X, y, numeric_features
 
 
+def scale_train_test(X_train, X_test):
+    """Fit scaler on training features and transform both train and test sets."""
+    scaler = StandardScaler()
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index,
+    )
+    X_test_scaled = pd.DataFrame(
+        scaler.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index,
+    )
+
+    print("\nScaling applied after train/test split using training set statistics.")
+    return X_train_scaled, X_test_scaled, scaler
+
+
+def perform_knn_grid_search(X_train, y_train, cv=5):
+    """Tune KNN hyperparameters using GridSearchCV optimizing the fraud F1 score."""
+    param_grid = {
+        "n_neighbors": [3, 5, 7, 9, 11, 13, 15, 17, 19],
+        "weights": ["uniform", "distance"],
+        "metric": ["euclidean", "manhattan", "minkowski"],
+        "p": [1, 2],
+    }
+
+    knn = KNeighborsClassifier()
+    cv_strategy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+
+    grid_search = GridSearchCV(
+        estimator=knn,
+        param_grid=param_grid,
+        scoring="f1",
+        n_jobs=-1,
+        cv=cv_strategy,
+        verbose=1,
+        return_train_score=True,
+    )
+
+    print("\nStarting GridSearchCV for KNN hyperparameter tuning...")
+    grid_search.fit(X_train, y_train)
+    print("\nGridSearchCV completed.")
+    print(f"Best parameters: {grid_search.best_params_}")
+    print(f"Best CV F1 score: {grid_search.best_score_:.4f}")
+
+    return grid_search
+
+
+def _save_baseline_results(results_df, output_path):
+    """Save the KNN comparison results to a CSV file."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(output_path, index=False)
+    print(f"Saved baseline results to: {output_path}")
+    return output_path
+
+
 def run_baseline_knn_model(output_path=None):
     """Run the baseline KNN workflow using all processed numerical features."""
     raw_df = load_creditcard_csv()
-    processed_df, _ = preprocess_dataset(raw_df)
+
+    print("\nApplying preprocessing steps without leaking test data...")
+    cleaned_df = remove_duplicates(raw_df)
+    cleaned_df = handle_missing_values(cleaned_df)
 
     target_column = "is_fraud"
-    X, y, numeric_features = select_numeric_features(processed_df, target_column=target_column)
+    X, y, numeric_features = select_numeric_features(cleaned_df, target_column=target_column)
 
     print("\nUsing all processed numerical features:")
     print(numeric_features)
@@ -168,26 +244,35 @@ def run_baseline_knn_model(output_path=None):
         target_column=target_column,
     )
 
+    print("\nChecking feature scaling order...")
+    X_train, X_test, scaler = scale_train_test(X_train, X_test)
+
     print("\nApplying SMOTE to training data only...\n")
     X_train, y_train = apply_smote_to_training_data(X_train, y_train)
 
-    print("\nTesting KNN with k values [1, 3, 5, 7, 9, 11, 13, 15]...\n")
-    results_df, best_k, best_model = test_multiple_k_values(
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        k_values=[1, 3, 5, 7, 9, 11, 13, 15],
-    )
+    grid_search = perform_knn_grid_search(X_train, y_train)
+    best_model = grid_search.best_estimator_
 
-    best_row = results_df.loc[results_df["K"] == best_k].iloc[0]
-    print("\nBaseline KNN summary")
-    print(f"Accuracy: {best_row['Accuracy']:.4f}")
-    print(f"Precision: {best_row['Precision']:.4f}")
-    print(f"Recall: {best_row['Recall']:.4f}")
-    print(f"F1 Score: {best_row['F1 Score']:.4f}")
+    print("\nEvaluating the best KNN model on the untouched test set...")
+    y_pred = best_model.predict(X_test)
+    metrics = compute_evaluation_metrics(y_test, y_pred)
+    cm, report = evaluate_best_model(best_model, X_test, y_test)
 
-    evaluate_best_model(best_model, X_test, y_test)
+    print("\nFinal test-set metrics for best KNN model:")
+    print(f"Accuracy: {metrics['accuracy']:.4f}")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall: {metrics['recall']:.4f}")
+    print(f"F1 Score: {metrics['f1_score']:.4f}")
+
+    results_df = pd.DataFrame(grid_search.cv_results_)
+    results_df = results_df[
+        [
+            "rank_test_score",
+            "mean_test_score",
+            "std_test_score",
+            "params",
+        ]
+    ].sort_values(by=["rank_test_score"])
 
     if output_path is None:
         output_path = Path(__file__).resolve().parents[1] / "baseline_results.csv"
@@ -195,7 +280,7 @@ def run_baseline_knn_model(output_path=None):
     _save_baseline_results(results_df, output_path)
     _save_trained_model(best_model, filename="baseline_best_knn.pkl")
 
-    return results_df, int(best_k), best_model, Path(output_path)
+    return results_df, grid_search.best_params_, best_model, Path(output_path)
 
 
 def main():
@@ -210,3 +295,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

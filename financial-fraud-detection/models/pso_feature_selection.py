@@ -3,8 +3,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.utils.validation import check_X_y
 from pyswarms.discrete import BinaryPSO
 
@@ -116,11 +116,7 @@ def select_pso_features(
     X_values, y_values = check_X_y(X_values, y)
     dimensions = X_values.shape[1]
 
-    estimator = LogisticRegression(
-        solver="liblinear",
-        max_iter=1000,
-        random_state=random_state,
-    )
+    estimator = KNeighborsClassifier(n_neighbors=5)
 
     options = {"c1": 2.0, "c2": 2.0, "w": 0.9, "k": 15, "p": 2}
     optimizer = BinaryPSO(
