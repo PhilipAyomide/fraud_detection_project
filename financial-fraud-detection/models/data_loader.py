@@ -23,7 +23,7 @@ def display_dataset_info(df):
     fraud_count = df["is_fraud"].sum()
     # Assume the target column is named "is_fraud" where 1 labels fraud and 0 labels legitimate.
     legit_count = (df["is_fraud"] == 0).sum()
-    # Count rows where the "Class" column equals 0 for legitimate transactions.
+    # Count rows where the target column equals 0 for legitimate transactions.
 
     print(f"Number of rows: {rows}")
     print(f"Number of columns: {cols}")
@@ -43,6 +43,5 @@ if __name__ == "__main__":
         print(f"Error: {e}")
         print("Please add creditcard.csv to the data/ folder to run this script.")
     except KeyError as e:
-        # Catch KeyError if the "Class" column is missing.
         print(f"Error: {e}")
-        print("Ensure creditcard.csv has a 'Class' column.")
+        print("Ensure creditcard.csv has an 'is_fraud' target column.")

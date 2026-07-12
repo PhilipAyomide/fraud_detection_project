@@ -1,4 +1,3 @@
-import os
 import pickle
 from pathlib import Path
 
@@ -7,11 +6,20 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.metrics import (
-    confusion_matrix,
-    classification_report,
-    roc_curve,
     auc,
+    classification_report,
+    confusion_matrix,
+    roc_curve,
 )
+
+try:
+    from .data_loader import load_creditcard_csv
+    from .knn_model import DEFAULT_MODEL_FILENAME, load_model_bundle
+    from .preprocessing import prepare_datasets
+except ImportError:
+    from data_loader import load_creditcard_csv
+    from knn_model import DEFAULT_MODEL_FILENAME, load_model_bundle
+    from preprocessing import prepare_datasets
 
 
 def _ensure_output_dir(output_dir: Path):
@@ -35,11 +43,9 @@ def plot_confusion_matrix(y_true, y_pred, output_path: Path, labels=None):
 
 def save_classification_report(y_true, y_pred, output_txt: Path, output_png: Path):
     report = classification_report(y_true, y_pred, digits=4)
-    # Save textual report
-    with open(output_txt, "w") as f:
-        f.write(report)
+    with open(output_txt, "w", encoding="utf-8") as report_file:
+        report_file.write(report)
 
-    # Also render as a simple image for dashboards
     plt.figure(figsize=(6, 4))
     plt.axis("off")
     plt.text(0, 0.5, report, fontfamily="monospace", fontsize=10)
@@ -67,37 +73,36 @@ def plot_roc_curve(y_true, y_score, output_path: Path):
     plt.close()
 
 
-def evaluate_model(model, X_test, y_test, output_dir=None, labels=None):
-    """Run evaluation and save charts/text to `output_dir`.
+def _select_model_features(X_test, model_bundle):
+    """Align evaluation features with the columns used during training."""
+    selected_features = model_bundle.get("selected_features") or model_bundle.get("feature_columns")
+    if not selected_features:
+        return X_test
 
-    Parameters
-    ----------
-    model : sklearn-like estimator
-        Fitted model. Must implement `predict`. Preferably `predict_proba`.
-    X_test : array-like or pandas.DataFrame
-    y_test : array-like or pandas.Series
-    output_dir : str or Path, optional
-    labels : list, optional
-    """
+    missing_features = [col for col in selected_features if col not in X_test.columns]
+    if missing_features:
+        raise KeyError(f"Evaluation data is missing trained features: {missing_features}")
+
+    return X_test[selected_features]
+
+
+def evaluate_model(model, X_test, y_test, output_dir=None, labels=None):
+    """Run evaluation and save charts/text to `output_dir`."""
     repo_root = Path(__file__).resolve().parents[1]
     if output_dir is None:
         output_dir = repo_root / "static" / "images"
     output_dir = Path(output_dir)
     _ensure_output_dir(output_dir)
 
-    # Predictions
     y_pred = model.predict(X_test)
 
-    # Confusion matrix
     cm_path = output_dir / "confusion_matrix.png"
     plot_confusion_matrix(y_test, y_pred, cm_path, labels=labels)
 
-    # Classification report
     report_txt = output_dir / "classification_report.txt"
     report_png = output_dir / "classification_report.png"
     save_classification_report(y_test, y_pred, report_txt, report_png)
 
-    # ROC curve - need scores/probabilities for positive class
     try:
         if hasattr(model, "predict_proba"):
             y_score = model.predict_proba(X_test)[:, 1]
@@ -109,15 +114,17 @@ def evaluate_model(model, X_test, y_test, output_dir=None, labels=None):
         roc_path = output_dir / "roc_curve.png"
         plot_roc_curve(y_test, y_score, roc_path)
     except Exception as exc:
-        # If ROC cannot be produced, write a small note
         note_path = output_dir / "roc_error.txt"
-        with open(note_path, "w") as f:
-            f.write(f"ROC could not be generated: {exc}\n")
+        with open(note_path, "w", encoding="utf-8") as note_file:
+            note_file.write(f"ROC could not be generated: {exc}\n")
 
 
 def load_model(model_path: Path):
-    with open(model_path, "rb") as f:
-        return pickle.load(f)
+    with open(model_path, "rb") as model_file:
+        artifact = pickle.load(model_file)
+    if isinstance(artifact, dict) and "model" in artifact:
+        return artifact["model"]
+    return artifact
 
 
 def main(model_filepath: str = None):
@@ -128,23 +135,20 @@ def main(model_filepath: str = None):
     parser.add_argument("--output", dest="output", help="Output directory for images", default=None)
     args = parser.parse_args()
 
-    # Lazy import to avoid heavy imports when used as a module
-    from data_loader import load_creditcard_csv
-    from preprocessing import preprocess_dataset, split_train_test
-
-    # Load and prepare data
     raw_df = load_creditcard_csv()
-    processed_df, _ = preprocess_dataset(raw_df)
-    X_train, X_test, y_train, y_test = split_train_test(processed_df)
+    datasets = prepare_datasets(raw_df, apply_smote=False)
+    X_test = datasets["X_test"]
+    y_test = datasets["y_test"]
 
-    # Load model
     repo_root = Path(__file__).resolve().parents[1]
-    default_model = repo_root / "trained_models" / "knn.pkl"
+    default_model = repo_root / "trained_models" / DEFAULT_MODEL_FILENAME
     model_path = Path(args.model) if args.model else default_model
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    model = load_model(model_path)
+    model_bundle = load_model_bundle(model_path)
+    model = model_bundle["model"]
+    X_test = _select_model_features(X_test, model_bundle)
 
     evaluate_model(model, X_test, y_test, output_dir=(Path(args.output) if args.output else None))
 

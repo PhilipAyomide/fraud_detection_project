@@ -4,6 +4,200 @@ from sklearn.preprocessing import StandardScaler  # Import StandardScaler to nor
 from sklearn.model_selection import train_test_split  # Import train_test_split to divide data into training and testing sets.
 from imblearn.over_sampling import SMOTE  # Import SMOTE to balance imbalanced class distributions.
 
+DEFAULT_TARGET_COLUMN = "is_fraud"
+IDENTIFIER_SUFFIXES = ("_id", "id")
+
+
+def drop_identifier_columns(df, target_column=DEFAULT_TARGET_COLUMN):
+    """Drop identifier columns that should not be used as model features."""
+    feature_frame = df.drop(columns=[target_column], errors="ignore")
+    identifier_cols = [
+        col
+        for col in feature_frame.columns
+        if col.lower() == "transactionid"
+        or col.lower().endswith("_id")
+        or col.lower().endswith("id")
+        or "identifier" in col.lower()
+        or col.lower().endswith("_time")
+        or col.lower() == "transaction_time"
+    ]
+    if identifier_cols:
+        print("Identifier columns detected and dropped:")
+        for col in identifier_cols:
+            print(f"  - {col}")
+    return df.drop(columns=identifier_cols, errors="ignore")
+
+
+def encode_categorical_features(df, target_column=DEFAULT_TARGET_COLUMN, max_categories=30):
+    """One-hot encode low-cardinality categorical columns for model training."""
+    feature_frame = df.drop(columns=[target_column], errors="ignore")
+    categorical_cols = feature_frame.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+
+    if not categorical_cols:
+        print("No categorical columns detected for encoding.")
+        return df
+
+    high_cardinality = [
+        col for col in categorical_cols if feature_frame[col].nunique(dropna=True) > max_categories
+    ]
+    if high_cardinality:
+        print("Dropping high-cardinality categorical columns:")
+        for col in high_cardinality:
+            print(f"  - {col} ({feature_frame[col].nunique(dropna=True)} unique values)")
+        df = df.drop(columns=high_cardinality, errors="ignore")
+        categorical_cols = [col for col in categorical_cols if col not in high_cardinality]
+
+    if not categorical_cols:
+        return df
+
+    print("Encoding categorical columns:")
+    for col in categorical_cols:
+        print(f"  - {col}")
+
+    encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=True, dtype=int)
+    print(f"Encoded feature count after one-hot encoding: {encoded.shape[1] - 1}")
+    return encoded
+
+
+def build_feature_matrix(df, target_column=DEFAULT_TARGET_COLUMN):
+    """Clean raw data and return a feature matrix with encoded categoricals."""
+    cleaned = remove_duplicates(df)
+    cleaned = handle_missing_values(cleaned)
+    cleaned = drop_identifier_columns(cleaned, target_column=target_column)
+    categorical_cols = (
+        cleaned.drop(columns=[target_column], errors="ignore")
+        .select_dtypes(include=["object", "string", "category"])
+        .columns.tolist()
+    )
+    cleaned = encode_categorical_features(cleaned, target_column=target_column)
+
+    if target_column not in cleaned.columns:
+        raise KeyError(f"Target column '{target_column}' not found after feature engineering.")
+
+    feature_frame = cleaned.drop(columns=[target_column])
+    numeric_features = feature_frame.select_dtypes(include=[np.number]).columns.tolist()
+    if not numeric_features:
+        raise ValueError("No numeric features remain after feature engineering.")
+
+    feature_df = cleaned[numeric_features + [target_column]].copy()
+    print(f"Final training columns ({len(numeric_features)}): {numeric_features}")
+    return feature_df, numeric_features, categorical_cols
+
+
+def prepare_inference_sample(payload, feature_columns, scaler=None, selected_features=None):
+    """Transform a raw transaction payload into model-ready features."""
+    if not isinstance(payload, dict):
+        raise ValueError("Payload must be a dictionary of transaction fields.")
+
+    frame = pd.DataFrame([payload])
+    frame = drop_identifier_columns(frame, target_column=DEFAULT_TARGET_COLUMN)
+
+    categorical_cols = frame.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+    if categorical_cols:
+        frame = pd.get_dummies(frame, columns=categorical_cols, drop_first=True, dtype=int)
+
+    aligned = pd.DataFrame(0, index=[0], columns=feature_columns, dtype=float)
+    for column in frame.columns:
+        if column in aligned.columns:
+            aligned.loc[0, column] = frame.iloc[0][column]
+
+    if scaler is not None:
+        aligned_values = scaler.transform(aligned)
+        aligned = pd.DataFrame(aligned_values, columns=feature_columns)
+
+    if selected_features:
+        aligned = aligned[selected_features]
+
+    return aligned
+
+
+def scale_train_test(X_train, X_test):
+    """Fit scaler on training features and transform both train and test sets."""
+    scaler = StandardScaler()
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        index=X_train.index,
+    )
+    X_test_scaled = pd.DataFrame(
+        scaler.transform(X_test),
+        columns=X_test.columns,
+        index=X_test.index,
+    )
+    print("\nScaling applied after train/test split using training set statistics.")
+    return X_train_scaled, X_test_scaled, scaler
+
+
+def subsample_stratified(X, y, max_samples=50000, random_state=42):
+    """Reduce training size while preserving class balance for faster KNN fitting."""
+    if len(X) <= max_samples:
+        print(f"Training set size ({len(X)}) is within max_samples={max_samples}; no subsampling applied.")
+        return X, y
+
+    print(f"Subsampling training set from {len(X)} to {max_samples} rows (stratified).")
+    X_sampled, _, y_sampled, _ = train_test_split(
+        X,
+        y,
+        train_size=max_samples,
+        stratify=y,
+        random_state=random_state,
+    )
+    print("Subsampled class distribution:")
+    print(y_sampled.value_counts())
+    return X_sampled, y_sampled
+
+
+def prepare_datasets(
+    df,
+    target_column=DEFAULT_TARGET_COLUMN,
+    test_size=0.2,
+    random_state=42,
+    max_train_samples=50000,
+    smote_sampling_strategy=0.5,
+    apply_smote=True,
+):
+    """Canonical preprocessing pipeline without data leakage.
+
+    Steps: clean -> encode -> split -> scale (train stats only) -> optional SMOTE (train only).
+    """
+    feature_df, feature_names, categorical_cols = build_feature_matrix(df, target_column=target_column)
+
+    X_train, X_test, y_train, y_test = split_train_test(
+        feature_df,
+        target_column=target_column,
+        test_size=test_size,
+        random_state=random_state,
+    )
+
+    X_train, X_test, scaler = scale_train_test(X_train, X_test)
+    X_train, y_train = subsample_stratified(
+        X_train,
+        y_train,
+        max_samples=max_train_samples,
+        random_state=random_state,
+    )
+
+    if apply_smote:
+        print("\nApplying partial SMOTE to training data only...\n")
+        X_train, y_train = apply_smote_to_training_data(
+            X_train,
+            y_train,
+            random_state=random_state,
+            sampling_strategy=smote_sampling_strategy,
+        )
+
+    return {
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "scaler": scaler,
+        "feature_names": feature_names,
+        "feature_columns": X_train.columns.tolist(),
+        "categorical_columns": categorical_cols,
+        "target_column": target_column,
+    }
+
 
 def remove_duplicates(df):
     """
@@ -151,55 +345,24 @@ def scale_features(df, target_column='is_fraud'):
     return df_scaled, scaler
 
 
-def preprocess_dataset(df, target_column='is_fraud'):
-    """
-    Complete preprocessing pipeline: remove duplicates, handle missing values, and scale features.
-    
-    This function applies all preprocessing steps in sequence and returns a cleaned,
-    normalized dataset ready for model training.
-    
-    Parameters:
-    -----------
-    df : pandas.DataFrame
-        The raw input DataFrame from the data loader.
-    
-    target_column : str, default='is_fraud'
-        The name of the target column (should not be scaled).
-    
-    Returns:
-    --------
-    pandas.DataFrame
-        The preprocessed DataFrame with:
-        - Duplicates removed
-        - Missing values handled
-        - Numerical features scaled to mean=0, std=1
-    
-    scaler : sklearn.preprocessing.StandardScaler
-        The fitted scaler object for transforming future data.
+def preprocess_dataset(df, target_column=DEFAULT_TARGET_COLUMN):
+    """Build a cleaned feature matrix without scaling.
+
+    Scaling must happen after train/test split to avoid data leakage.
+    Prefer `prepare_datasets()` for end-to-end model training and evaluation.
     """
     print("=" * 60)
-    print("Starting data preprocessing pipeline...")
+    print("Starting feature engineering pipeline (no scaling)...")
     print("=" * 60)
-    
-    # Step 1: Remove duplicates.
-    print("\nStep 1: Removing duplicates...")
-    df_no_dupes = remove_duplicates(df)
-    
-    # Step 2: Handle missing values.
-    print("\nStep 2: Handling missing values...")
-    df_no_missing = handle_missing_values(df_no_dupes)
-    
-    # Step 3: Scale numerical features.
-    print("\nStep 3: Scaling numerical features...")
-    df_scaled, scaler = scale_features(df_no_missing, target_column=target_column)
-    
-    # Print final summary.
+
+    feature_df, _, _ = build_feature_matrix(df, target_column=target_column)
+
     print("\n" + "=" * 60)
-    print("Preprocessing complete!")
-    print(f"Final dataset shape: {df_scaled.shape}")
+    print("Feature engineering complete!")
+    print(f"Final dataset shape: {feature_df.shape}")
     print("=" * 60)
-    
-    return df_scaled, scaler
+
+    return feature_df, None
 
 
 def split_train_test(df, target_column='is_fraud', test_size=0.2, random_state=42):
@@ -277,7 +440,12 @@ def split_train_test(df, target_column='is_fraud', test_size=0.2, random_state=4
     return X_train, X_test, y_train, y_test
 
 
-def apply_smote_to_training_data(X_train, y_train, random_state=42):
+def apply_smote_to_training_data(
+    X_train,
+    y_train,
+    random_state=42,
+    sampling_strategy=0.5,
+):
     """Apply SMOTE oversampling to the training dataset only.
 
     This function MUST be called after `split_train_test()` so that SMOTE is
@@ -292,6 +460,8 @@ def apply_smote_to_training_data(X_train, y_train, random_state=42):
         Training labels corresponding to `X_train`.
     random_state : int, default=42
         Random seed for SMOTE reproducibility.
+    sampling_strategy : float or dict, default=0.5
+        Target minority-to-majority ratio. Use 1.0 for full balancing.
 
     Returns
     -------
@@ -299,27 +469,13 @@ def apply_smote_to_training_data(X_train, y_train, random_state=42):
         Oversampled training features as a DataFrame with the original column names.
     y_resampled : pandas.Series
         Oversampled training labels as a Series (balanced counts for each class).
-
-    Steps
-    -----
-    1. Print class distribution before SMOTE so the user can see imbalance.
-    2. Create and apply SMOTE to `X_train` and `y_train` only.
-    3. Convert the numpy outputs back to pandas objects and print new distribution.
-    4. Return balanced `X_resampled` and `y_resampled`.
     """
 
-    # 1) Show class distribution before applying SMOTE
-    # `value_counts()` gives the raw counts for each label (e.g., 0: legit, 1: fraud)
     print("Training class distribution before SMOTE:")
     counts_before = y_train.value_counts()
     print(counts_before)
 
-    # 2) Create SMOTE instance from imbalanced-learn. SMOTE generates synthetic
-    # samples of the minority class by interpolating between nearest neighbors.
-    smote = SMOTE(random_state=random_state)
-
-    # 3) Apply SMOTE to the training set only. `fit_resample` returns numpy
-    # arrays for X and y. This does not touch the test set, preventing leakage.
+    smote = SMOTE(random_state=random_state, sampling_strategy=sampling_strategy)
     X_resampled_array, y_resampled_array = smote.fit_resample(X_train, y_train)
 
     # 4) Convert back to pandas objects. Preserve original feature names.
@@ -338,30 +494,18 @@ def apply_smote_to_training_data(X_train, y_train, random_state=42):
 
 
 if __name__ == "__main__":
-    # Entry point for testing the preprocessing functions.
-    from data_loader import load_creditcard_csv
-    
     try:
-        # Load the raw dataset.
+        from data_loader import load_creditcard_csv
+    except ImportError:
+        from .data_loader import load_creditcard_csv
+
+    try:
         raw_df = load_creditcard_csv()
         print(f"Raw dataset shape: {raw_df.shape}\n")
-        
-        # Apply preprocessing pipeline.
-        processed_df, fitted_scaler = preprocess_dataset(raw_df)
-        
-        # Display a preview of the processed dataset.
-        print("\nFirst 5 rows of processed data:")
-        print(processed_df.head())
-        
-        # Split the preprocessed data into training and testing sets.
-        print("\n")
-        X_train, X_test, y_train, y_test = split_train_test(processed_df)
 
-        # Apply SMOTE oversampling only to the training set, leaving the test set unchanged.
-        X_train_resampled, y_train_resampled = apply_smote_to_training_data(X_train, y_train)
-
-        print("\nData split complete and ready for model training!")
-        print("Note: test data is unchanged and not oversampled.")
-        
+        datasets = prepare_datasets(raw_df)
+        print("\nCanonical pipeline complete and ready for model training!")
+        print(f"Training shape: {datasets['X_train'].shape}")
+        print(f"Testing shape: {datasets['X_test'].shape}")
     except Exception as e:
         print(f"Error during preprocessing: {e}")

@@ -28,7 +28,7 @@ def _binary_fitness(particles, X, y, estimator, cv, scoring, penalty):
                 y,
                 cv=cv,
                 scoring=scoring,
-                n_jobs=-1,
+                n_jobs=1,
             )
             score_mean = np.mean(scores)
         except Exception:
